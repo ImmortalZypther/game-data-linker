@@ -627,6 +627,66 @@ end
 
 -- ── Artwork saving to Steam grid folder ────────────────────────────────
 
+-- Helper function to grab hashed asset links from the API. The existing code will try to find all the links it can, and when it can't find any, it'll fill in the gaps with a call to the API here.
+-- Successes return a map of imageType -> url, matching SetCustomArtworkForApp's ints:
+--   0: portrait grid, 1: hero, 2: logo, 3: wide capsule.
+-- Failures return {}.
+local artwork_url_cache = {}
+function resolve_artwork_urls(steam_app_id)
+    local appid = tostring(steam_app_id or "")
+    if appid == "" then return cjson.encode({}) end
+
+    local cached = artwork_url_cache[appid]
+    if cached ~= nil then
+        if cached == false then return cjson.encode({}) end
+        return cjson.encode(cached)
+    end
+
+    local url = "https://api.steamcmd.net/v1/info/" .. appid
+    local ok, res = pcall(http.get, url, { headers = { ["Accept"] = "application/json" }, timeout = 15 })
+    if not ok or not res or res.status ~= 200 or not res.body then
+        logger:warn("Artwork hash lookup failed for appid " .. appid)
+        artwork_url_cache[appid] = false
+        return cjson.encode({})
+    end
+
+    local okj, body = pcall(cjson.decode, res.body)
+    local assets = okj and type(body) == "table" and type(body.data) == "table"
+        and type(body.data[appid]) == "table" and type(body.data[appid].common) == "table"
+        and body.data[appid].common.library_assets_full or nil
+    if type(assets) ~= "table" then
+        logger:warn("No library_assets_full for appid " .. appid)
+        artwork_url_cache[appid] = false
+        return cjson.encode({})
+    end
+
+    local base = "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/" .. appid .. "/"
+    -- Format: { PICS key, SetCustomArtworkForApp imageType }
+    local slots = {
+        { "library_capsule", "0" },
+        { "library_hero",    "1" },
+        { "library_logo",    "2" },
+        { "library_header",  "3" },
+    }
+
+    local urls = {}
+    for _, slot in ipairs(slots) do
+        local entry = assets[slot[1]]
+        if type(entry) == "table" then
+            -- Prefer the 2x variant.
+            local file = (type(entry.image2x) == "table" and entry.image2x.english)
+                      or (type(entry.image)   == "table" and entry.image.english)
+            if type(file) == "string" and file ~= "" then
+                urls[slot[2]] = base .. file
+            end
+        end
+    end
+
+    artwork_url_cache[appid] = urls
+    logger:info("Resolved artwork URLs for appid " .. appid)
+    return cjson.encode(urls)
+end
+
 function save_artwork(shortcut_app_id, steam_app_id)
     local account_id = get_active_account_id()
     if not account_id then

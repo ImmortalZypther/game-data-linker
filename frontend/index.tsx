@@ -9,6 +9,7 @@ const fetchGameData         = callable<[{ steam_app_id: string }], string>('fetc
 const fetchFriendPersonasBackend = callable<[{ steam_ids_csv: string }], string>('fetch_friend_personas');
 const fetchCommunityContentBackend = callable<[{ steam_app_id: string }], string>('fetch_community_content');
 const feLogBackend         = callable<[{ msg: string }], string>('fe_log');
+const resolveArtworkUrlsBackend = callable<[{ steam_app_id: string }], string>('resolve_artwork_urls');
 
 // ── Epic Games Store backend callables ─────────────────────────────────
 const epicStatus           = callable<[], string>('epic_status');
@@ -1591,8 +1592,9 @@ async function imageUrlToBase64(url: string): Promise<string | null> {
 	return await attempt(proxied);
 }
 
-/** Artwork persistence key prefix in localStorage (v3 = uses file extension not mime type) */
-const ART_STORAGE_PREFIX = 'gdl_artwork4_';
+/** Artwork persistence key prefix in localStorage (v3 = uses file extension not
+ *  mime type; v5 = recovers slots that 404 on the legacy CDN via hashed URLs) */
+const ART_STORAGE_PREFIX = 'gdl_artwork5_';
 
 function artworkAlreadySaved(shortcutAppId: number, steamAppId: string): boolean {
 	try {
@@ -1646,14 +1648,32 @@ async function spoofArtwork(shortcutAppId: number, steamAppId: string, force = f
 	const extMap: Record<string, string> = { '.jpg': 'jpg', '.jpeg': 'jpg', '.png': 'png' };
 
 	// Download all images in parallel
-	const downloads = await Promise.all(
-		sources.map(async ([url, imageType, label]) => {
+	type Download = { url: string; dataUrl: string | null; imageType: number; label: string };
+	const downloads: Download[] = await Promise.all(
+		sources.map(async ([url, imageType, label]): Promise<Download> => {
 			try {
 				const dataUrl = await imageUrlToBase64(url);
 				return { url, dataUrl, imageType, label };
 			} catch { return { url, dataUrl: null, imageType, label }; }
 		})
 	);
+
+	// Parses for CDN paths that have hashes in them. If the original code doesn't find a link for an asset, call the API to find a list of assets.
+	// Eg: steamstatic.com/store_item_assets/steam/apps/2950790/91a172cd9ff7cc855eb8dd21bdcf41a39c0e4d75/library_capsule.jpg
+	if (downloads.some(d => !d.dataUrl)) {
+		try {
+			const hashed = JSON.parse(await resolveArtworkUrlsBackend({ steam_app_id: steamAppId })) || {};
+			for (const d of downloads) {
+				const alt = hashed[String(d.imageType)];
+				if (d.dataUrl || !alt) continue;
+				try {
+					d.dataUrl = await imageUrlToBase64(alt);
+					d.url = alt;
+					backendLog('Artwork recovered via hashed URL: ' + d.label + ' -> ' + alt);
+				} catch { /* left empty to fallback to backendLog below */ }
+			}
+		} catch (e) { backendLog('Artwork hash lookup failed: ' + e); }
+	}
 
 	let successCount = 0;
 	for (const { url, dataUrl, imageType, label } of downloads) {
