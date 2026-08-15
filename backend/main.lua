@@ -595,8 +595,12 @@ local function get_active_account_id()
     local content = f:read("*a")
     f:close()
 
+    -- Current Steam no longer writes MostRecent, so fall back to the newest
+    -- Timestamp. MostRecent still wins where older builds do write it.
     local current_id = nil
     local most_recent_id = nil
+    local newest_id = nil
+    local newest_ts = -1
     for line in content:gmatch("[^\r\n]+") do
         local id64 = line:match('^%s*"(%d%d%d%d%d%d%d%d%d+)"%s*$')
         if id64 then
@@ -605,10 +609,16 @@ local function get_active_account_id()
         if current_id and line:match('"MostRecent"%s*"1"') then
             most_recent_id = current_id
         end
+        local ts = current_id and line:match('"Timestamp"%s*"(%d+)"')
+        if ts and tonumber(ts) > newest_ts then
+            newest_ts = tonumber(ts)
+            newest_id = current_id
+        end
     end
 
+    most_recent_id = most_recent_id or newest_id
     if not most_recent_id then
-        logger:warn("No MostRecent user found in loginusers.vdf")
+        logger:warn("No usable user found in loginusers.vdf")
         return nil
     end
 
@@ -651,14 +661,14 @@ function resolve_artwork_urls(steam_app_id)
     end
 
     local okj, body = pcall(cjson.decode, res.body)
-    local assets = okj and type(body) == "table" and type(body.data) == "table"
-        and type(body.data[appid]) == "table" and type(body.data[appid].common) == "table"
-        and body.data[appid].common.library_assets_full or nil
-    if type(assets) ~= "table" then
-        logger:warn("No library_assets_full for appid " .. appid)
+    local common = okj and type(body) == "table" and type(body.data) == "table"
+        and type(body.data[appid]) == "table" and body.data[appid].common or nil
+    if type(common) ~= "table" then
+        logger:warn("No appinfo for appid " .. appid)
         artwork_url_cache[appid] = false
         return cjson.encode({})
     end
+    local assets = type(common.library_assets_full) == "table" and common.library_assets_full or {}
 
     local base = "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/" .. appid .. "/"
     -- Format: { PICS key, SetCustomArtworkForApp imageType }
@@ -682,9 +692,49 @@ function resolve_artwork_urls(steam_app_id)
         end
     end
 
+    -- The icon lives on a different host and is paired to the clienticon hash;
+    -- the plain "icon" hash only serves .jpg. Not a SetCustomArtworkForApp slot.
+    if type(common.clienticon) == "string" and common.clienticon ~= "" then
+        urls.icon = "https://shared.fastly.steamstatic.com/community_assets/images/apps/"
+            .. appid .. "/" .. common.clienticon .. ".ico"
+    end
+
     artwork_url_cache[appid] = urls
     logger:info("Resolved artwork URLs for appid " .. appid)
     return cjson.encode(urls)
+end
+
+-- Icons can't go through SetCustomArtworkForApp, so the file is written to the
+-- grid folder and the frontend points the shortcut at it via SetShortcutIcon.
+-- Steam's icon picker takes png/tga, so the .ico bytes land under a .png name.
+function save_shortcut_icon(shortcut_app_id, steam_app_id)
+    local urls = cjson.decode(resolve_artwork_urls(steam_app_id))
+    local url = type(urls) == "table" and urls.icon or nil
+    if not url then
+        return cjson.encode({ error = "No icon for appid " .. tostring(steam_app_id) })
+    end
+
+    local account_id = get_active_account_id()
+    if not account_id then
+        return cjson.encode({ error = "Could not determine active Steam user" })
+    end
+
+    local grid_dir = fs.join(millennium.steam_path(), "userdata", account_id, "config", "grid")
+    if not fs.exists(grid_dir) then
+        fs.create_directories(grid_dir)
+    end
+    local filepath = fs.join(grid_dir, tostring(shortcut_app_id) .. "_icon.png")
+
+    -- http.download streams to disk; http.get truncates chunked replies.
+    local ok, res = pcall(http.download, url, filepath)
+    if not ok or not res or res.status ~= 200 or not res.bytes_written or res.bytes_written <= 100 then
+        os.remove(filepath)
+        logger:warn("Icon download failed: " .. url)
+        return cjson.encode({ error = "Icon download failed" })
+    end
+
+    logger:info("Saved icon: " .. filepath .. " (" .. tostring(res.bytes_written) .. " bytes)")
+    return cjson.encode({ path = filepath })
 end
 
 function save_artwork(shortcut_app_id, steam_app_id)
@@ -762,7 +812,7 @@ function clear_artwork(shortcut_app_id)
     local sid = tostring(shortcut_app_id)
 
     local removed = 0
-    for _, suffix in ipairs({ "p", "_hero", "_logo", "" }) do
+    for _, suffix in ipairs({ "p", "_hero", "_logo", "_icon", "" }) do
         for _, ext in ipairs({ "jpg", "jpeg", "png" }) do
             local filepath = fs.join(grid_dir, sid .. suffix .. "." .. ext)
             if fs.exists(filepath) then

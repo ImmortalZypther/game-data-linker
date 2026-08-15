@@ -10,6 +10,7 @@ const fetchFriendPersonasBackend = callable<[{ steam_ids_csv: string }], string>
 const fetchCommunityContentBackend = callable<[{ steam_app_id: string }], string>('fetch_community_content');
 const feLogBackend         = callable<[{ msg: string }], string>('fe_log');
 const resolveArtworkUrlsBackend = callable<[{ steam_app_id: string }], string>('resolve_artwork_urls');
+const saveShortcutIconBackend = callable<[{ shortcut_app_id: string; steam_app_id: string }], string>('save_shortcut_icon');
 
 // ── Epic Games Store backend callables ─────────────────────────────────
 const epicStatus           = callable<[], string>('epic_status');
@@ -1594,7 +1595,7 @@ async function imageUrlToBase64(url: string): Promise<string | null> {
 
 /** Artwork persistence key prefix in localStorage (v3 = uses file extension not
  *  mime type; v5 = recovers slots that 404 on the legacy CDN via hashed URLs) */
-const ART_STORAGE_PREFIX = 'gdl_artwork5_';
+const ART_STORAGE_PREFIX = 'gdl_artwork6_';
 
 function artworkAlreadySaved(shortcutAppId: number, steamAppId: string): boolean {
 	try {
@@ -1701,6 +1702,22 @@ async function spoofArtwork(shortcutAppId: number, steamAppId: string, force = f
 		} catch (e) {
 			backendLog('Artwork error (' + label + '): ' + e);
 		}
+	}
+
+	// Icons have no SetCustomArtworkForApp slot: the backend writes the file and
+	// we point the shortcut at it.
+	if (typeof sc?.Apps?.SetShortcutIcon === 'function') {
+		try {
+			const icon = JSON.parse(await saveShortcutIconBackend({
+				shortcut_app_id: String(shortcutAppId), steam_app_id: steamAppId,
+			}));
+			if (icon?.path) {
+				await sc.Apps.SetShortcutIcon(shortcutAppId, icon.path);
+				backendLog('Icon set for ' + shortcutAppId + ' -> ' + icon.path);
+			} else {
+				backendLog('Icon not set: ' + (icon?.error || 'unknown'));
+			}
+		} catch (e) { backendLog('Icon error: ' + e); }
 	}
 
 	if (successCount > 0) {
